@@ -60,12 +60,16 @@ module.exports = (pool) => {
   router.patch('/:id', async (req, res) => {
     try {
       const empresaId = empresaObjetivo(req);
-      const { name, rol, modulosPermitidos, estado } = req.body;
+      const { name, rol, modulosPermitidos, estado, password } = req.body;
       const fields = []; const values = []; let i = 1;
       if (name !== undefined) { fields.push(`name = $${i++}`); values.push(name); }
       if (rol !== undefined && !(req.rol === 'admin_empresa' && rol === 'superadmin')) { fields.push(`rol = $${i++}`); values.push(rol); }
       if (modulosPermitidos !== undefined) { fields.push(`modulos_permitidos = $${i++}`); values.push(JSON.stringify(modulosPermitidos)); }
       if (estado !== undefined) { fields.push(`estado = $${i++}`); values.push(estado); }
+      if (password) {
+        if (password.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
+        fields.push(`password_hash = $${i++}`); values.push(await bcrypt.hash(password, 10));
+      }
       if (fields.length === 0) return res.status(400).json({ error: 'Nada que actualizar' });
 
       values.push(req.params.id, empresaId);

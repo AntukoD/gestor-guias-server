@@ -3,6 +3,38 @@ const authMiddleware = require('../middleware/auth');
 const { requireModulo } = require('../middleware/roles');
 const { recalcularStats } = require('../lib/stats');
 const { registrarAuditoria } = require('../lib/audit');
+const { subirImagen, borrarImagen } = require('../lib/storage');
+
+// Compara las imágenes que llegan del formulario contra las que ya existen en la BD:
+// - las que traen una URL (empiezan con "http") ya están en R2 → se conservan tal cual
+// - las que traen un data URI (empiezan con "data:") son nuevas → se suben a R2
+// - las que existían en la BD pero ya no vienen en el payload → se borran (BD + R2)
+async function sincronizarImagenes(client, { empresaId, serviceId, payloadImages }) {
+  const existentesRes = await client.query(
+    'SELECT id, r2_key FROM images WHERE service_id = $1 AND empresa_id = $2',
+    [serviceId, empresaId]
+  );
+  const existentes = existentesRes.rows;
+  const idsAConservar = new Set(
+    payloadImages.filter(img => typeof img.data === 'string' && img.data.startsWith('http')).map(img => img.id)
+  );
+
+  const aBorrar = existentes.filter(e => !idsAConservar.has(e.id));
+  for (const img of aBorrar) {
+    await client.query('DELETE FROM images WHERE id = $1', [img.id]);
+  }
+
+  const aSubir = payloadImages.filter(img => typeof img.data === 'string' && img.data.startsWith('data:'));
+  for (const img of aSubir) {
+    const subida = await subirImagen({ empresaId, serviceId, nombreArchivo: img.name, dataUri: img.data });
+    await client.query(
+      'INSERT INTO images (service_id, empresa_id, name, url, r2_key, type, size_bytes) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [serviceId, empresaId, img.name, subida.url, subida.key, img.type, subida.sizeBytes]
+    );
+  }
+
+  return { keysABorrarDeR2: aBorrar.map(e => e.r2_key).filter(Boolean) };
+}
 
 module.exports = (pool) => {
   const router = express.Router();
@@ -51,7 +83,7 @@ module.exports = (pool) => {
       const servicesResult = await pool.query(
         `SELECT s.*,
           COALESCE(json_agg(DISTINCT jsonb_build_object('id', i.id, 'name', i.name, 'quantity', i.quantity)) FILTER (WHERE i.id IS NOT NULL), '[]') as items,
-          COALESCE(json_agg(DISTINCT jsonb_build_object('id', im.id, 'name', im.name, 'data', im.data, 'type', im.type)) FILTER (WHERE im.id IS NOT NULL), '[]') as images
+          COALESCE(json_agg(DISTINCT jsonb_build_object('id', im.id, 'name', im.name, 'data', COALESCE(im.url, im.data), 'type', im.type)) FILTER (WHERE im.id IS NOT NULL), '[]') as images
         FROM services s
         LEFT JOIN items i ON i.service_id = s.id
         LEFT JOIN images im ON im.service_id = s.id
@@ -99,13 +131,7 @@ module.exports = (pool) => {
       }
 
       const allImages = [...(hojas || []).map(h => ({ ...h, type: 'hoja' })), ...(fotos || []).map(f => ({ ...f, type: 'foto' }))];
-      for (const img of allImages) {
-        const sizeBytes = Buffer.byteLength(img.data || '', 'utf8');
-        await client.query(
-          'INSERT INTO images (service_id, empresa_id, name, data, type, size_bytes) VALUES ($1,$2,$3,$4,$5,$6)',
-          [id, req.empresaId, img.name, img.data, img.type, sizeBytes]
-        );
-      }
+      await sincronizarImagenes(client, { empresaId: req.empresaId, serviceId: id, payloadImages: allImages });
 
       await client.query('COMMIT');
       await recalcularStats(pool, req.empresaId);
@@ -142,17 +168,11 @@ module.exports = (pool) => {
         }
       }
 
-      await client.query('DELETE FROM images WHERE service_id = $1 AND empresa_id = $2', [req.params.id, req.empresaId]);
       const allImages = [...(hojas || []).map(h => ({ ...h, type: 'hoja' })), ...(fotos || []).map(f => ({ ...f, type: 'foto' }))];
-      for (const img of allImages) {
-        const sizeBytes = Buffer.byteLength(img.data || '', 'utf8');
-        await client.query(
-          'INSERT INTO images (service_id, empresa_id, name, data, type, size_bytes) VALUES ($1,$2,$3,$4,$5,$6)',
-          [req.params.id, req.empresaId, img.name, img.data, img.type, sizeBytes]
-        );
-      }
+      const { keysABorrarDeR2 } = await sincronizarImagenes(client, { empresaId: req.empresaId, serviceId: req.params.id, payloadImages: allImages });
 
       await client.query('COMMIT');
+      for (const key of keysABorrarDeR2) await borrarImagen(key); // best-effort, fuera de la transacción
       await recalcularStats(pool, req.empresaId);
       await registrarAuditoria(pool, { empresaId: req.empresaId, userId: req.userId, accion: 'editar', entidad: 'servicio', entidadId: req.params.id, detalle: { name } });
       res.json({ success: true });
@@ -166,8 +186,13 @@ module.exports = (pool) => {
 
   router.delete('/services/:id', async (req, res) => {
     try {
+      const imgsRes = await pool.query('SELECT r2_key FROM images WHERE service_id = $1 AND empresa_id = $2', [req.params.id, req.empresaId]);
+      await pool.query('DELETE FROM items WHERE service_id = $1 AND empresa_id = $2', [req.params.id, req.empresaId]);
+      await pool.query('DELETE FROM images WHERE service_id = $1 AND empresa_id = $2', [req.params.id, req.empresaId]);
       const del = await pool.query('DELETE FROM services WHERE id = $1 AND empresa_id = $2', [req.params.id, req.empresaId]);
       if (del.rowCount === 0) return res.status(404).json({ error: 'Servicio no encontrado' });
+
+      for (const row of imgsRes.rows) await borrarImagen(row.r2_key); // best-effort
       await recalcularStats(pool, req.empresaId);
       await registrarAuditoria(pool, { empresaId: req.empresaId, userId: req.userId, accion: 'eliminar', entidad: 'servicio', entidadId: req.params.id });
       res.json({ success: true });

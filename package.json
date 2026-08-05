@@ -4,7 +4,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "seed:superadmin": "node scripts/seed-superadmin.js"
+    "seed:superadmin": "node scripts/seed-superadmin.js",
+    "migrate:images-r2": "node scripts/migrate-images-to-r2.js"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -13,6 +14,7 @@
     "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.2",
     "dotenv": "^16.3.1",
-    "express-rate-limit": "^7.4.0"
+    "express-rate-limit": "^7.4.0",
+    "@aws-sdk/client-s3": "^3.700.0"
   }
 }
