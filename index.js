@@ -3,7 +3,10 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const pool = require('./db');
 require('dotenv').config();
-
+console.log('--- Verificación R2 ---');
+console.log('R2_BUCKET_NAME:', JSON.stringify(process.env.R2_BUCKET_NAME));
+console.log('R2_PUBLIC_URL:', JSON.stringify(process.env.R2_PUBLIC_URL));
+console.log('-----------------------');
 const app = express();
 
 // CORS: si defines ALLOWED_ORIGINS en el .env (separados por coma), solo esos
