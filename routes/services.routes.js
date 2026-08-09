@@ -83,7 +83,7 @@ module.exports = (pool) => {
       const servicesResult = await pool.query(
         `SELECT s.*,
           COALESCE(json_agg(DISTINCT jsonb_build_object('id', i.id, 'name', i.name, 'quantity', i.quantity)) FILTER (WHERE i.id IS NOT NULL), '[]') as items,
-          COALESCE(json_agg(DISTINCT jsonb_build_object('id', im.id, 'name', im.name, 'data', COALESCE(im.url, im.data), 'type', im.type)) FILTER (WHERE im.id IS NOT NULL), '[]') as images
+          COALESCE(json_agg(DISTINCT jsonb_build_object('id', im.id, 'name', im.name, 'data', im.url, 'type', im.type)) FILTER (WHERE im.id IS NOT NULL), '[]') as images
         FROM services s
         LEFT JOIN items i ON i.service_id = s.id
         LEFT JOIN images im ON im.service_id = s.id

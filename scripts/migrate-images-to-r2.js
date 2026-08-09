@@ -10,6 +10,14 @@ const pool = require('../db');
 const { subirImagen } = require('../lib/storage');
 
 async function main() {
+  const colExiste = await pool.query(
+    `SELECT 1 FROM information_schema.columns WHERE table_name = 'images' AND column_name = 'data'`
+  );
+  if (colExiste.rows.length === 0) {
+    console.log('La columna "data" ya no existe en la tabla images (fue eliminada). No hay nada que migrar: cualquier imagen que no tuviera "url" antes de eliminarla se perdió y no se puede recuperar desde aquí.');
+    process.exit(0);
+  }
+
   const pendientes = await pool.query(
     'SELECT id, service_id, empresa_id, name, data, type FROM images WHERE url IS NULL AND data IS NOT NULL'
   );
