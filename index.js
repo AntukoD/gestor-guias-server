@@ -36,6 +36,7 @@ app.use('/api/auth/login', loginLimiter);
 app.use('/api/auth', require('./routes/auth.routes')(pool));
 app.use('/api/superadmin', require('./routes/superadmin.routes')(pool));
 app.use('/api/usuarios', require('./routes/usuarios.routes')(pool));
+app.use('/api/almacen', require('./routes/almacen.routes')(pool));
 app.use('/api', require('./routes/services.routes')(pool)); // expone /api/services y /api/statuses
 
 app.get('/', (req, res) => res.json({ status: 'ok', servicio: 'gestor-guias-api' }));
