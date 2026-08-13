@@ -3,44 +3,89 @@ const authMiddleware = require('../middleware/auth');
 const { requireModulo } = require('../middleware/roles');
 const { aplicarMovimiento } = require('../lib/almacen');
 const { registrarAuditoria } = require('../lib/audit');
+const { recalcularStats } = require('../lib/stats');
 
 module.exports = (pool) => {
   const router = express.Router();
   router.use(authMiddleware);
   router.use(requireModulo(pool, 'almacen'));
 
-  // ---- Almacenes ----
+  // ---- Almacenes (fijos o móviles — ej: cajas de EPP asignadas a una persona) ----
   router.get('/almacenes', async (req, res) => {
     try {
-      const r = await pool.query('SELECT * FROM almacenes WHERE empresa_id = $1 ORDER BY nombre', [req.empresaId]);
+      const r = await pool.query(`
+        SELECT a.*, p.nombre as asignado_a_nombre
+        FROM almacenes a
+        LEFT JOIN personal p ON p.id = a.asignado_a_personal_id
+        WHERE a.empresa_id = $1 ORDER BY a.nombre
+      `, [req.empresaId]);
       res.json(r.rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
   router.post('/almacenes', async (req, res) => {
     try {
-      const { nombre, ubicacion, responsable } = req.body;
+      const { nombre, ubicacion, responsable, tipo, asignadoAPersonalId } = req.body;
       if (!nombre) return res.status(400).json({ error: 'nombre es obligatorio' });
       const r = await pool.query(
-        'INSERT INTO almacenes (empresa_id, nombre, ubicacion, responsable) VALUES ($1,$2,$3,$4) RETURNING *',
-        [req.empresaId, nombre, ubicacion || null, responsable || null]
+        `INSERT INTO almacenes (empresa_id, nombre, ubicacion, responsable, tipo, asignado_a_personal_id)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+        [req.empresaId, nombre, ubicacion || null, responsable || null, tipo === 'movil' ? 'movil' : 'fijo', asignadoAPersonalId || null]
       );
       await registrarAuditoria(pool, { empresaId: req.empresaId, userId: req.userId, accion: 'crear', entidad: 'almacen', entidadId: r.rows[0].id, detalle: { nombre } });
+      await recalcularStats(pool, req.empresaId);
       res.json(r.rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
   router.patch('/almacenes/:id', async (req, res) => {
     try {
-      const { nombre, ubicacion, responsable, activo } = req.body;
+      const { nombre, ubicacion, responsable, activo, tipo, asignadoAPersonalId } = req.body;
       const fields = []; const values = []; let i = 1;
       if (nombre !== undefined) { fields.push(`nombre = $${i++}`); values.push(nombre); }
       if (ubicacion !== undefined) { fields.push(`ubicacion = $${i++}`); values.push(ubicacion); }
       if (responsable !== undefined) { fields.push(`responsable = $${i++}`); values.push(responsable); }
       if (activo !== undefined) { fields.push(`activo = $${i++}`); values.push(activo); }
+      if (tipo !== undefined) { fields.push(`tipo = $${i++}`); values.push(tipo === 'movil' ? 'movil' : 'fijo'); }
+      if (asignadoAPersonalId !== undefined) { fields.push(`asignado_a_personal_id = $${i++}`); values.push(asignadoAPersonalId || null); }
       if (!fields.length) return res.status(400).json({ error: 'Nada que actualizar' });
       values.push(req.params.id, req.empresaId);
       await pool.query(`UPDATE almacenes SET ${fields.join(', ')} WHERE id = $${i++} AND empresa_id = $${i}`, values);
+      res.json({ success: true });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  // ---- Personal (técnicos/colaboradores — no siempre tienen cuenta en el sistema) ----
+  router.get('/personal', async (req, res) => {
+    try {
+      const r = await pool.query('SELECT * FROM personal WHERE empresa_id = $1 ORDER BY nombre', [req.empresaId]);
+      res.json(r.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  router.post('/personal', async (req, res) => {
+    try {
+      const { nombre, costoHora } = req.body;
+      if (!nombre) return res.status(400).json({ error: 'nombre es obligatorio' });
+      const r = await pool.query(
+        'INSERT INTO personal (empresa_id, nombre, costo_hora) VALUES ($1,$2,$3) RETURNING *',
+        [req.empresaId, nombre, costoHora || null]
+      );
+      await registrarAuditoria(pool, { empresaId: req.empresaId, userId: req.userId, accion: 'crear', entidad: 'personal', entidadId: r.rows[0].id, detalle: { nombre } });
+      res.json(r.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+  router.patch('/personal/:id', async (req, res) => {
+    try {
+      const { nombre, costoHora, activo } = req.body;
+      const fields = []; const values = []; let i = 1;
+      if (nombre !== undefined) { fields.push(`nombre = $${i++}`); values.push(nombre); }
+      if (costoHora !== undefined) { fields.push(`costo_hora = $${i++}`); values.push(costoHora); }
+      if (activo !== undefined) { fields.push(`activo = $${i++}`); values.push(activo); }
+      if (!fields.length) return res.status(400).json({ error: 'Nada que actualizar' });
+      values.push(req.params.id, req.empresaId);
+      await pool.query(`UPDATE personal SET ${fields.join(', ')} WHERE id = $${i++} AND empresa_id = $${i}`, values);
       res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
@@ -59,21 +104,22 @@ module.exports = (pool) => {
 
   router.post('/productos', async (req, res) => {
     try {
-      const { codigo, nombre, unidad, categoria, stockMinimoAlerta } = req.body;
+      const { codigo, nombre, unidad, categoria, stockMinimoAlerta, tipoControl } = req.body;
       if (!nombre) return res.status(400).json({ error: 'nombre es obligatorio' });
       const r = await pool.query(
-        `INSERT INTO productos (empresa_id, codigo, nombre, unidad, categoria, stock_minimo_alerta)
-         VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-        [req.empresaId, codigo || null, nombre, unidad || 'unid', categoria || 'material', stockMinimoAlerta || 0]
+        `INSERT INTO productos (empresa_id, codigo, nombre, unidad, categoria, stock_minimo_alerta, tipo_control)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+        [req.empresaId, codigo || null, nombre, unidad || 'unid', categoria || 'material', stockMinimoAlerta || 0, tipoControl || 'consumo']
       );
       await registrarAuditoria(pool, { empresaId: req.empresaId, userId: req.userId, accion: 'crear', entidad: 'producto', entidadId: r.rows[0].id, detalle: { nombre } });
+      await recalcularStats(pool, req.empresaId);
       res.json(r.rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
   router.patch('/productos/:id', async (req, res) => {
     try {
-      const { codigo, nombre, unidad, categoria, stockMinimoAlerta, activo } = req.body;
+      const { codigo, nombre, unidad, categoria, stockMinimoAlerta, activo, tipoControl } = req.body;
       const fields = []; const values = []; let i = 1;
       if (codigo !== undefined) { fields.push(`codigo = $${i++}`); values.push(codigo); }
       if (nombre !== undefined) { fields.push(`nombre = $${i++}`); values.push(nombre); }
@@ -81,6 +127,7 @@ module.exports = (pool) => {
       if (categoria !== undefined) { fields.push(`categoria = $${i++}`); values.push(categoria); }
       if (stockMinimoAlerta !== undefined) { fields.push(`stock_minimo_alerta = $${i++}`); values.push(stockMinimoAlerta); }
       if (activo !== undefined) { fields.push(`activo = $${i++}`); values.push(activo); }
+      if (tipoControl !== undefined) { fields.push(`tipo_control = $${i++}`); values.push(tipoControl); }
       if (!fields.length) return res.status(400).json({ error: 'Nada que actualizar' });
       values.push(req.params.id, req.empresaId);
       await pool.query(`UPDATE productos SET ${fields.join(', ')} WHERE id = $${i++} AND empresa_id = $${i}`, values);
@@ -88,7 +135,7 @@ module.exports = (pool) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
-  // ---- Stock (vista combinada producto × almacén) ----
+  // ---- Stock (vista combinada producto × almacén, con ubicación física) ----
   router.get('/stock', async (req, res) => {
     try {
       const { almacen_id, categoria, bajo_minimo } = req.query;
@@ -99,9 +146,9 @@ module.exports = (pool) => {
       const having = bajo_minimo === 'true' ? 'HAVING COALESCE(s.cantidad,0) < p.stock_minimo_alerta' : '';
 
       const r = await pool.query(`
-        SELECT p.id as producto_id, p.codigo, p.nombre, p.unidad, p.categoria, p.stock_minimo_alerta,
-               a.id as almacen_id, a.nombre as almacen_nombre,
-               COALESCE(s.cantidad, 0) as cantidad
+        SELECT p.id as producto_id, p.codigo, p.nombre, p.unidad, p.categoria, p.stock_minimo_alerta, p.tipo_control,
+               a.id as almacen_id, a.nombre as almacen_nombre, a.tipo as almacen_tipo,
+               COALESCE(s.cantidad, 0) as cantidad, s.fila, s.columna, s.ubicacion
         FROM productos p
         CROSS JOIN almacenes a
         LEFT JOIN stock s ON s.producto_id = p.id AND s.almacen_id = a.id
@@ -113,21 +160,39 @@ module.exports = (pool) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
+  // Fijar/editar la ubicación física de un producto en un almacén, sin registrar un movimiento
+  router.put('/stock/ubicacion', async (req, res) => {
+    try {
+      const { almacenId, productoId, fila, columna, ubicacion } = req.body;
+      if (!almacenId || !productoId) return res.status(400).json({ error: 'almacenId y productoId son obligatorios' });
+      const r = await pool.query(
+        `INSERT INTO stock (empresa_id, almacen_id, producto_id, cantidad, fila, columna, ubicacion)
+         VALUES ($1,$2,$3,0,$4,$5,$6)
+         ON CONFLICT (almacen_id, producto_id) DO UPDATE SET fila = $4, columna = $5, ubicacion = $6
+         RETURNING *`,
+        [req.empresaId, almacenId, productoId, fila || null, columna || null, ubicacion || null]
+      );
+      res.json(r.rows[0]);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
   // ---- Movimientos ----
   router.post('/movimientos', async (req, res) => {
     const client = await pool.connect();
     try {
-      const { almacenId, productoId, tipoMovimiento, cantidad, costoUnitario, guiaId, tecnico, nota } = req.body;
+      const { almacenId, productoId, tipoMovimiento, cantidad, costoUnitario, guiaId, tecnico, personalId, numeroFactura, nota } = req.body;
       if (!almacenId || !productoId || !tipoMovimiento || cantidad === undefined) {
         return res.status(400).json({ error: 'almacenId, productoId, tipoMovimiento y cantidad son obligatorios' });
       }
       await client.query('BEGIN');
       const { movimiento, stockNuevo } = await aplicarMovimiento(client, {
         empresaId: req.empresaId, almacenId, productoId, tipoMovimiento,
-        cantidad: Number(cantidad), costoUnitario, guiaId: guiaId || null, tecnico, nota, userId: req.userId
+        cantidad: Number(cantidad), costoUnitario, guiaId: guiaId || null, tecnico,
+        personalId: personalId || null, numeroFactura: numeroFactura || null, nota, userId: req.userId
       });
       await client.query('COMMIT');
       await registrarAuditoria(pool, { empresaId: req.empresaId, userId: req.userId, accion: 'crear', entidad: 'movimiento_almacen', entidadId: movimiento.id, detalle: { tipoMovimiento, cantidad } });
+      await recalcularStats(pool, req.empresaId);
       res.json({ movimiento, stockNuevo });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -141,7 +206,7 @@ module.exports = (pool) => {
   router.post('/movimientos/transferencia', async (req, res) => {
     const client = await pool.connect();
     try {
-      const { almacenOrigenId, almacenDestinoId, productoId, cantidad, tecnico, nota } = req.body;
+      const { almacenOrigenId, almacenDestinoId, productoId, cantidad, tecnico, personalId, nota } = req.body;
       if (!almacenOrigenId || !almacenDestinoId || !productoId || !cantidad) {
         return res.status(400).json({ error: 'Faltan datos de la transferencia' });
       }
@@ -152,14 +217,15 @@ module.exports = (pool) => {
       await client.query('BEGIN');
       const salida = await aplicarMovimiento(client, {
         empresaId: req.empresaId, almacenId: almacenOrigenId, productoId,
-        tipoMovimiento: 'transferencia_salida', cantidad: Number(cantidad), tecnico, nota, userId: req.userId
+        tipoMovimiento: 'transferencia_salida', cantidad: Number(cantidad), tecnico, personalId: personalId || null, nota, userId: req.userId
       });
       const entrada = await aplicarMovimiento(client, {
         empresaId: req.empresaId, almacenId: almacenDestinoId, productoId,
-        tipoMovimiento: 'transferencia_entrada', cantidad: Number(cantidad), tecnico, nota, userId: req.userId
+        tipoMovimiento: 'transferencia_entrada', cantidad: Number(cantidad), tecnico, personalId: personalId || null, nota, userId: req.userId
       });
       await client.query('COMMIT');
       await registrarAuditoria(pool, { empresaId: req.empresaId, userId: req.userId, accion: 'crear', entidad: 'transferencia_almacen', detalle: { almacenOrigenId, almacenDestinoId, productoId, cantidad } });
+      await recalcularStats(pool, req.empresaId);
       res.json({ salida: salida.movimiento, entrada: entrada.movimiento });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -181,11 +247,13 @@ module.exports = (pool) => {
       if (hasta) { conds.push(`m.created_at <= $${i++}`); vals.push(hasta); }
 
       const r = await pool.query(`
-        SELECT m.*, p.nombre as producto_nombre, p.unidad, a.nombre as almacen_nombre, u.email as usuario_email
+        SELECT m.*, p.nombre as producto_nombre, p.unidad, a.nombre as almacen_nombre,
+               u.email as usuario_email, per.nombre as personal_nombre
         FROM movimientos_almacen m
         JOIN productos p ON p.id = m.producto_id
         JOIN almacenes a ON a.id = m.almacen_id
         LEFT JOIN users u ON u.id = m.created_by
+        LEFT JOIN personal per ON per.id = m.personal_id
         WHERE ${conds.join(' AND ')}
         ORDER BY m.created_at DESC
         LIMIT 300
