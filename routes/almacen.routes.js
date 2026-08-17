@@ -4,6 +4,7 @@ const { requireModulo } = require('../middleware/roles');
 const { aplicarMovimiento } = require('../lib/almacen');
 const { registrarAuditoria } = require('../lib/audit');
 const { recalcularStats } = require('../lib/stats');
+const { subirArchivo, borrarImagen } = require('../lib/storage');
 
 module.exports = (pool) => {
   const router = express.Router();
@@ -104,12 +105,19 @@ module.exports = (pool) => {
 
   router.post('/productos', async (req, res) => {
     try {
-      const { codigo, nombre, unidad, categoria, stockMinimoAlerta, tipoControl } = req.body;
+      const { codigo, nombre, unidad, categoria, stockMinimoAlerta, tipoControl, foto } = req.body;
       if (!nombre) return res.status(400).json({ error: 'nombre es obligatorio' });
+
+      let fotoUrl = null, fotoKey = null;
+      if (foto && typeof foto === 'string' && foto.startsWith('data:')) {
+        const subida = await subirArchivo({ empresaId: req.empresaId, carpeta: 'productos', nombreArchivo: nombre, dataUri: foto });
+        fotoUrl = subida.url; fotoKey = subida.key;
+      }
+
       const r = await pool.query(
-        `INSERT INTO productos (empresa_id, codigo, nombre, unidad, categoria, stock_minimo_alerta, tipo_control)
-         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-        [req.empresaId, codigo || null, nombre, unidad || 'unid', categoria || 'material', stockMinimoAlerta || 0, tipoControl || 'consumo']
+        `INSERT INTO productos (empresa_id, codigo, nombre, unidad, categoria, stock_minimo_alerta, tipo_control, foto_url, foto_r2_key)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [req.empresaId, codigo || null, nombre, unidad || 'unid', categoria || 'material', stockMinimoAlerta || 0, tipoControl || 'consumo', fotoUrl, fotoKey]
       );
       await registrarAuditoria(pool, { empresaId: req.empresaId, userId: req.userId, accion: 'crear', entidad: 'producto', entidadId: r.rows[0].id, detalle: { nombre } });
       await recalcularStats(pool, req.empresaId);
@@ -119,7 +127,7 @@ module.exports = (pool) => {
 
   router.patch('/productos/:id', async (req, res) => {
     try {
-      const { codigo, nombre, unidad, categoria, stockMinimoAlerta, activo, tipoControl } = req.body;
+      const { codigo, nombre, unidad, categoria, stockMinimoAlerta, activo, tipoControl, foto } = req.body;
       const fields = []; const values = []; let i = 1;
       if (codigo !== undefined) { fields.push(`codigo = $${i++}`); values.push(codigo); }
       if (nombre !== undefined) { fields.push(`nombre = $${i++}`); values.push(nombre); }
@@ -128,9 +136,20 @@ module.exports = (pool) => {
       if (stockMinimoAlerta !== undefined) { fields.push(`stock_minimo_alerta = $${i++}`); values.push(stockMinimoAlerta); }
       if (activo !== undefined) { fields.push(`activo = $${i++}`); values.push(activo); }
       if (tipoControl !== undefined) { fields.push(`tipo_control = $${i++}`); values.push(tipoControl); }
+
+      let keyABorrar = null;
+      if (foto && typeof foto === 'string' && foto.startsWith('data:')) {
+        const actual = await pool.query('SELECT foto_r2_key FROM productos WHERE id = $1 AND empresa_id = $2', [req.params.id, req.empresaId]);
+        keyABorrar = actual.rows[0]?.foto_r2_key || null;
+        const subida = await subirArchivo({ empresaId: req.empresaId, carpeta: 'productos', nombreArchivo: nombre || 'producto', dataUri: foto });
+        fields.push(`foto_url = $${i++}`); values.push(subida.url);
+        fields.push(`foto_r2_key = $${i++}`); values.push(subida.key);
+      }
+
       if (!fields.length) return res.status(400).json({ error: 'Nada que actualizar' });
       values.push(req.params.id, req.empresaId);
       await pool.query(`UPDATE productos SET ${fields.join(', ')} WHERE id = $${i++} AND empresa_id = $${i}`, values);
+      if (keyABorrar) await borrarImagen(keyABorrar);
       res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
@@ -146,12 +165,12 @@ module.exports = (pool) => {
       const having = bajo_minimo === 'true' ? 'HAVING COALESCE(s.cantidad,0) < p.stock_minimo_alerta' : '';
 
       const r = await pool.query(`
-        SELECT p.id as producto_id, p.codigo, p.nombre, p.unidad, p.categoria, p.stock_minimo_alerta, p.tipo_control,
+        SELECT p.id as producto_id, p.codigo, p.nombre, p.unidad, p.categoria, p.stock_minimo_alerta, p.tipo_control, p.foto_url,
                a.id as almacen_id, a.nombre as almacen_nombre, a.tipo as almacen_tipo,
                COALESCE(s.cantidad, 0) as cantidad, s.fila, s.columna, s.ubicacion
-        FROM productos p
-        CROSS JOIN almacenes a
-        LEFT JOIN stock s ON s.producto_id = p.id AND s.almacen_id = a.id
+        FROM stock s
+        JOIN productos p ON p.id = s.producto_id
+        JOIN almacenes a ON a.id = s.almacen_id
         WHERE ${conds.join(' AND ')} AND a.empresa_id = p.empresa_id
         ${having}
         ORDER BY p.nombre, a.nombre
